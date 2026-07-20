@@ -1,7 +1,7 @@
 ## PodThing
 
 **PodThing** lets you manage your pre-iOS iPod (Classic, Nano, Mini and Shuffle) on Linux without the need for proprietary software. 
-You can easelly add/remove songs and see useful information about your iPod such as the model, storage and number of songs on the device.
+You can easelly add/remove podcasts, songs, photos and videos and see useful information about your iPod such as the model, storage and the number of different media types on the device.
 
 ### Tools used:
 - **Programming language:** [Go](https://go.dev/)

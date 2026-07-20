@@ -18,10 +18,11 @@ typedef struct {
 } DeviceInfo;
 
 typedef struct {
-	char *title;
-	char *artist;
-	char *album;
-	int   id;
+	char   *title;
+	char   *artist;
+	char   *album;
+	int     id;
+	guint32 mediatype;
 } TrackInfo;
 
 static int has_storage_info() {
@@ -86,6 +87,7 @@ TrackInfo *get_tracks_info(const char *mountpoint, int *out_count) {
 		infos[i].artist = g_strdup((t->artist && strlen(t->artist)) ? t->artist : "Unknown Artist");
 		infos[i].album  = g_strdup((t->album  && strlen(t->album))  ? t->album  : "Unknown Album");
 		infos[i].id     = t->id;
+		infos[i].mediatype = t->mediatype;
 		i++;
 		tl = tl->next;
 	}
@@ -104,7 +106,7 @@ void free_tracks_info(TrackInfo *infos, int count) {
 	free(infos);
 }
 
-int add_track(const char *mountpoint, const char *file_path) {
+int add_track(const char *mountpoint, const char *file_path, guint32 mediatype) {
 	GError *err = NULL;
 	Itdb_iTunesDB *itdb = itdb_parse(mountpoint, &err);
 	if (!itdb) {
@@ -112,7 +114,7 @@ int add_track(const char *mountpoint, const char *file_path) {
 		return -1;
 	}
 	Itdb_Track *track = itdb_track_new();
-	track->mediatype = 0x00000001;
+	track->mediatype = mediatype;
 	char *base = g_path_get_basename(file_path);
 	char *dot  = strrchr(base, '.');
 	if (dot) *dot = '\0';
@@ -123,6 +125,19 @@ int add_track(const char *mountpoint, const char *file_path) {
 	itdb_track_add(itdb, track, -1);
 	Itdb_Playlist *mpl = itdb_playlist_mpl(itdb);
 	if (mpl) itdb_playlist_add_track(mpl, track, -1);
+	if (mediatype == 0x00000004) {
+		Itdb_Playlist *pod = itdb_playlist_podcasts(itdb);
+		if (!pod) {
+			pod = itdb_playlist_new("Podcasts", FALSE);
+			itdb_playlist_set_podcasts(pod);
+			itdb_playlist_add(itdb, pod, -1);
+		}
+		itdb_playlist_add_track(pod, track, -1);
+		track->skip_when_shuffling        = 0x01;
+		track->remember_playback_position = 0x01;
+		track->mark_unplayed              = 0x02;
+		track->flag4                      = 0x01;
+	}
 	if (!itdb_cp_track_to_ipod(track, (char *)file_path, &err)) {
 		if (err) { g_printerr("cp failed: %s\n", err->message); g_error_free(err); }
 		itdb_free(itdb);
@@ -172,6 +187,113 @@ int delete_track_by_id(const char *mountpoint, int track_id) {
 	itdb_free(itdb);
 	return 0;
 }
+
+typedef struct {
+	char *name;
+	int   id;
+} PhotoInfo;
+
+int get_photos_count(const char *mountpoint) {
+	GError *err = NULL;
+	Itdb_PhotoDB *db = itdb_photodb_parse(mountpoint, &err);
+	if (!db) {
+		if (err) g_error_free(err);
+		return 0;
+	}
+	int count = 0;
+	GList *l = db->photos;
+	while (l) { count++; l = l->next; }
+	itdb_photodb_free(db);
+	return count;
+}
+
+PhotoInfo *get_photos_info(const char *mountpoint, int *out_count) {
+	GError *err = NULL;
+	Itdb_PhotoDB *db = itdb_photodb_parse(mountpoint, &err);
+	if (!db) {
+		if (err) g_error_free(err);
+		*out_count = 0;
+		return NULL;
+	}
+	int count = 0;
+	GList *l = db->photos;
+	while (l) { count++; l = l->next; }
+	PhotoInfo *infos = (PhotoInfo *)malloc(sizeof(PhotoInfo) * (count > 0 ? count : 1));
+	int i = 0;
+	l = db->photos;
+	while (l) {
+		Itdb_Artwork *art = (Itdb_Artwork *)l->data;
+		char buf[64];
+		snprintf(buf, sizeof(buf), "Photo %d", art->id);
+		infos[i].name = g_strdup(buf);
+		infos[i].id   = art->id;
+		i++;
+		l = l->next;
+	}
+	*out_count = count;
+	itdb_photodb_free(db);
+	return infos;
+}
+
+void free_photos_info(PhotoInfo *infos, int count) {
+	if (!infos) return;
+	for (int i = 0; i < count; i++)
+		g_free(infos[i].name);
+	free(infos);
+}
+
+int add_photo(const char *mountpoint, const char *file_path) {
+	GError *err = NULL;
+	Itdb_PhotoDB *db = itdb_photodb_parse(mountpoint, &err);
+	if (!db) {
+		if (err) { g_error_free(err); err = NULL; }
+		db = itdb_photodb_create(mountpoint);
+		if (!db) return -1;
+	}
+	Itdb_Artwork *art = itdb_photodb_add_photo(db, file_path, -1, 0, &err);
+	if (!art) {
+		if (err) { g_printerr("add photo failed: %s\n", err->message); g_error_free(err); }
+		itdb_photodb_free(db);
+		return -2;
+	}
+	Itdb_PhotoAlbum *album = itdb_photodb_photoalbum_by_name(db, NULL);
+	if (album) itdb_photodb_photoalbum_add_photo(db, album, art, -1);
+	if (!itdb_photodb_write(db, &err)) {
+		if (err) { g_printerr("photo write failed: %s\n", err->message); g_error_free(err); }
+		itdb_photodb_free(db);
+		return -3;
+	}
+	itdb_photodb_free(db);
+	return 0;
+}
+
+int delete_photo_by_id(const char *mountpoint, int photo_id) {
+	GError *err = NULL;
+	Itdb_PhotoDB *db = itdb_photodb_parse(mountpoint, &err);
+	if (!db) {
+		if (err) g_error_free(err);
+		return -1;
+	}
+	Itdb_Artwork *found = NULL;
+	GList *l = db->photos;
+	while (l) {
+		Itdb_Artwork *art = (Itdb_Artwork *)l->data;
+		if (art->id == (guint32)photo_id) { found = art; break; }
+		l = l->next;
+	}
+	if (!found) {
+		itdb_photodb_free(db);
+		return -2;
+	}
+	itdb_photodb_remove_photo(db, NULL, found);
+	if (!itdb_photodb_write(db, &err)) {
+		if (err) { g_printerr("photo write failed: %s\n", err->message); g_error_free(err); }
+		itdb_photodb_free(db);
+		return -3;
+	}
+	itdb_photodb_free(db);
+	return 0;
+}
 */
 import "C"
 
@@ -189,9 +311,20 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+)
+
+const (
+	MediaMusic    = 0x00000001
+	MediaVideo    = 0x00000002
+	MediaPodcast  = 0x00000004
+	MediaPhotoLib = 0x00020000
+
+	MediaMusicVideo = 0x00000020
+	MediaTVShow     = 0x00000040
 )
 
 type TrackInfo struct {
@@ -199,6 +332,7 @@ type TrackInfo struct {
 	Artist string
 	Album  string
 	ID     int
+	Type   uint32
 }
 
 type DeviceInfo struct {
@@ -212,12 +346,27 @@ type DeviceInfo struct {
 	TrackCount int
 }
 
+type MediaTypeInfo struct {
+	Name  string
+	Label string
+	Value uint32
+	Exts  []string
+}
+
 var (
 	mu                sync.Mutex
 	currentMountpoint string
 	fullTracks        []TrackInfo
 	filteredIndices   []int
 	selected          = make(map[int]bool)
+	currentMediaType  uint32 = MediaMusic
+
+	mediaTypes = []MediaTypeInfo{
+		{Name: "Music/Songs", Label: "Songs", Value: MediaMusic, Exts: []string{".mp3", ".aac", ".m4a", ".flac", ".ogg", ".wav"}},
+		{Name: "Podcasts", Label: "Podcasts", Value: MediaPodcast, Exts: []string{".mp3", ".aac", ".m4a", ".flac", ".ogg", ".wav"}},
+		{Name: "Videos", Label: "Videos", Value: MediaVideo, Exts: []string{".mp4", ".m4v", ".mov", ".avi", ".mkv", ".flv", ".wmv"}},
+		{Name: "Photos", Label: "Photos", Value: MediaPhotoLib, Exts: []string{".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"}},
+	}
 )
 
 func detectMountpoint() string {
@@ -253,10 +402,34 @@ func diskUsage(mp string) (capGB, usedGB, freeGB float64) {
 	return cap_ / gb, (cap_ - avail) / gb, avail / gb
 }
 
-func isAudio(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".wav":
-		return true
+func isFileType(path string, exts []string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, e := range exts {
+		if ext == e {
+			return true
+		}
+	}
+	return false
+}
+
+func getCurrentMediaTypeInfo() MediaTypeInfo {
+	for _, mt := range mediaTypes {
+		if mt.Value == currentMediaType {
+			return mt
+		}
+	}
+	return mediaTypes[0]
+}
+
+func matchesMediaType(t uint32, cat uint32) bool {
+	switch cat {
+	case MediaPodcast:
+		return t&MediaPodcast != 0
+	case MediaVideo:
+		return t&(MediaVideo|MediaMusicVideo|MediaTVShow) != 0
+	case MediaMusic:
+		return t&MediaPodcast == 0 &&
+			t&(MediaVideo|MediaMusicVideo|MediaTVShow) == 0
 	}
 	return false
 }
@@ -301,10 +474,11 @@ func fetchTracksInfo(mp string) []TrackInfo {
 	}
 	defer C.free_tracks_info(raw, count)
 	type cTrack struct {
-		title  *C.char
-		artist *C.char
-		album  *C.char
-		id     C.int
+		title     *C.char
+		artist    *C.char
+		album     *C.char
+		id        C.int
+		mediatype C.guint32
 	}
 	slice := unsafe.Slice((*cTrack)(unsafe.Pointer(raw)), int(count))
 	tracks := make([]TrackInfo, int(count))
@@ -314,9 +488,37 @@ func fetchTracksInfo(mp string) []TrackInfo {
 			Artist: C.GoString(t.artist),
 			Album:  C.GoString(t.album),
 			ID:     int(t.id),
+			Type:   uint32(t.mediatype),
 		}
 	}
 	return tracks
+}
+
+func fetchPhotosInfo(mp string) []TrackInfo {
+	cMp := C.CString(mp)
+	defer C.free(unsafe.Pointer(cMp))
+	var count C.int
+	raw := C.get_photos_info(cMp, &count)
+	if raw == nil {
+		return nil
+	}
+	defer C.free_photos_info(raw, count)
+	type cPhoto struct {
+		name *C.char
+		id   C.int
+	}
+	slice := unsafe.Slice((*cPhoto)(unsafe.Pointer(raw)), int(count))
+	photos := make([]TrackInfo, int(count))
+	for i, p := range slice {
+		photos[i] = TrackInfo{
+			Title:  C.GoString(p.name),
+			Artist: "",
+			Album:  "",
+			ID:     int(p.id),
+			Type:   MediaPhotoLib,
+		}
+	}
+	return photos
 }
 
 func doAddTrack(mp, path string) error {
@@ -324,7 +526,7 @@ func doAddTrack(mp, path string) error {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cMp))
 	defer C.free(unsafe.Pointer(cPath))
-	if ret := C.add_track(cMp, cPath); ret != 0 {
+	if ret := C.add_track(cMp, cPath, C.guint32(currentMediaType)); ret != 0 {
 		return fmt.Errorf("code %d", int(ret))
 	}
 	return nil
@@ -339,8 +541,62 @@ func doDeleteTrack(mp string, id int) error {
 	return nil
 }
 
+func doAddPhoto(mp, path string) error {
+	cMp   := C.CString(mp)
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cMp))
+	defer C.free(unsafe.Pointer(cPath))
+	if ret := C.add_photo(cMp, cPath); ret != 0 {
+		return fmt.Errorf("code %d", int(ret))
+	}
+	return nil
+}
+
+func doDeletePhoto(mp string, id int) error {
+	cMp := C.CString(mp)
+	defer C.free(unsafe.Pointer(cMp))
+	if ret := C.delete_photo_by_id(cMp, C.int(id)); ret != 0 {
+		return fmt.Errorf("code %d", int(ret))
+	}
+	return nil
+}
+
+func doAddCurrent(mp, path string) error {
+	if currentMediaType == MediaPhotoLib {
+		return doAddPhoto(mp, path)
+	}
+	return doAddTrack(mp, path)
+}
+
+func doDeleteCurrent(mp string, id int) error {
+	if currentMediaType == MediaPhotoLib {
+		return doDeletePhoto(mp, id)
+	}
+	return doDeleteTrack(mp, id)
+}
+
+func countByMediaType(tracks []TrackInfo, mediaType uint32) int {
+	if mediaType == MediaPhotoLib {
+		return len(tracks)
+	}
+	count := 0
+	for _, t := range tracks {
+		if matchesMediaType(t.Type, mediaType) {
+			count++
+		}
+	}
+	return count
+}
+
 func main() {
 	a := app.NewWithID("com.fcnst.podthing")
+	app.SetMetadata(fyne.AppMetadata{
+		ID:         "com.fcnst.podthing",
+		Name:       "PodThing",
+		Version:    "0.0.2",
+		Build:      1,
+		Migrations: map[string]bool{"fyneDo": true},
+	})
 	w := a.NewWindow("PodThing - Alpha")
 	w.Resize(fyne.NewSize(800, 500))
 	w.CenterOnScreen()
@@ -352,8 +608,8 @@ func main() {
 	capacityVal  := widget.NewLabel("-")
 	usedVal      := widget.NewLabel("-")
 	freeVal      := widget.NewLabel("-")
-	songsVal     := widget.NewLabel("-")
-	progressLabel := widget.NewLabel("")
+	contentVal   := widget.NewLabel("-")
+	contentTitle := widget.NewLabel("Songs")
 
 	updateDeviceUI := func(info DeviceInfo) {
 		if !info.Connected {
@@ -363,7 +619,7 @@ func main() {
 			capacityVal.SetText("-")
 			usedVal.SetText("-")
 			freeVal.SetText("-")
-			songsVal.SetText("-")
+			contentVal.SetText("-")
 			return
 		}
 		statusLabel.SetText("● Connected")
@@ -372,19 +628,22 @@ func main() {
 		capacityVal.SetText(fmt.Sprintf("%.1f GB", info.CapacityGB))
 		usedVal.SetText(fmt.Sprintf("%.1f GB", info.UsedGB))
 		freeVal.SetText(fmt.Sprintf("%.1f GB", info.FreeGB))
-		songsVal.SetText(fmt.Sprintf("%d", info.TrackCount))
 	}
+
+	progressLabel := widget.NewLabel("")
 
 	refreshStorage := func(mp string) {
 		if mp == "" {
 			return
 		}
 		_, usedGB, freeGB := diskUsage(mp)
-		info := fetchDeviceInfo(mp)
 		fyne.Do(func() {
 			usedVal.SetText(fmt.Sprintf("%.1f GB", usedGB))
 			freeVal.SetText(fmt.Sprintf("%.1f GB", freeGB))
-			songsVal.SetText(fmt.Sprintf("%d", info.TrackCount))
+			mu.Lock()
+			count := countByMediaType(fullTracks, currentMediaType)
+			mu.Unlock()
+			contentVal.SetText(fmt.Sprintf("%d", count))
 		})
 	}
 
@@ -414,7 +673,11 @@ func main() {
 	rebuildList := func() {
 		filter := strings.ToLower(searchEntry.Text)
 		filteredIndices = filteredIndices[:0]
+		photoMode := currentMediaType == MediaPhotoLib
 		for i, t := range fullTracks {
+			if !photoMode && !matchesMediaType(t.Type, currentMediaType) {
+				continue
+			}
 			if filter == "" ||
 				strings.Contains(strings.ToLower(t.Title), filter) ||
 				strings.Contains(strings.ToLower(t.Artist), filter) ||
@@ -433,21 +696,51 @@ func main() {
 	refreshTracks := func(mp string) {
 		var tracks []TrackInfo
 		if mp != "" {
-			tracks = fetchTracksInfo(mp)
+			if currentMediaType == MediaPhotoLib {
+				tracks = fetchPhotosInfo(mp)
+			} else {
+				tracks = fetchTracksInfo(mp)
+			}
 		}
 		fyne.Do(func() {
 			mu.Lock()
 			fullTracks = tracks
 			mu.Unlock()
 			rebuildList()
+			if mp != "" {
+				count := countByMediaType(tracks, currentMediaType)
+				contentVal.SetText(fmt.Sprintf("%d", count))
+			}
 		})
 	}
 
 	toggleBtn    := widget.NewButton("Connect", nil)
-	addBtn       := widget.NewButtonWithIcon("Add Songs", theme.FolderOpenIcon(), nil)
+	addBtn       := widget.NewButtonWithIcon("Add", theme.FolderOpenIcon(), nil)
 	addFolderBtn := widget.NewButtonWithIcon("Add Folder", theme.FolderIcon(), nil)
 	deleteBtn    := widget.NewButtonWithIcon("Delete Selected", theme.DeleteIcon(), nil)
 	deleteBtn.Importance = widget.DangerImportance
+
+	mediaTypeDropdown := widget.NewSelect(
+		[]string{"Music/Songs", "Podcasts", "Videos", "Photos"},
+		func(s string) {
+			for _, mt := range mediaTypes {
+				if mt.Name == s {
+					currentMediaType = mt.Value
+					contentTitle.SetText(mt.Label)
+					mu.Lock()
+					mp := currentMountpoint
+					mu.Unlock()
+					if mp == "" {
+						rebuildList()
+						return
+					}
+					go refreshTracks(mp)
+					break
+				}
+			}
+		},
+	)
+	mediaTypeDropdown.Selected = "Music/Songs"
 
 	setBusy := func(b bool) {
 		if b {
@@ -455,11 +748,13 @@ func main() {
 			addFolderBtn.Disable()
 			deleteBtn.Disable()
 			toggleBtn.Disable()
+			mediaTypeDropdown.Disable()
 		} else {
 			addBtn.Enable()
 			addFolderBtn.Enable()
 			deleteBtn.Enable()
 			toggleBtn.Enable()
+			mediaTypeDropdown.Enable()
 			progressLabel.SetText("")
 		}
 	}
@@ -519,6 +814,7 @@ func main() {
 	addBtn.OnTapped = func() {
 		mu.Lock()
 		mp := currentMountpoint
+		mt := getCurrentMediaTypeInfo()
 		mu.Unlock()
 		if mp == "" {
 			dialog.ShowError(fmt.Errorf("no iPod connected"), w)
@@ -532,18 +828,17 @@ func main() {
 			path := uc.URI().Path()
 			setBusy(true)
 			go runBatch(mp, []string{path}, "Adding", func(p string) error {
-				return doAddTrack(mp, p)
+				return doAddCurrent(mp, p)
 			})
 		}, w)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{
-			".mp3", ".aac", ".m4a", ".flac", ".ogg", ".wav",
-		}))
+		fd.SetFilter(storage.NewExtensionFileFilter(mt.Exts))
 		fd.Show()
 	}
 
 	addFolderBtn.OnTapped = func() {
 		mu.Lock()
 		mp := currentMountpoint
+		mt := getCurrentMediaTypeInfo()
 		mu.Unlock()
 		if mp == "" {
 			dialog.ShowError(fmt.Errorf("no iPod connected"), w)
@@ -555,13 +850,13 @@ func main() {
 			}
 			var paths []string
 			filepath.WalkDir(uri.Path(), func(p string, d os.DirEntry, err error) error {
-				if err == nil && !d.IsDir() && isAudio(p) {
+				if err == nil && !d.IsDir() && isFileType(p, mt.Exts) {
 					paths = append(paths, p)
 				}
 				return nil
 			})
 			if len(paths) == 0 {
-				dialog.ShowInformation("No audio files", "No supported audio files found.", w)
+				dialog.ShowInformation("No files", fmt.Sprintf("No %s files found.", mt.Name), w)
 				return
 			}
 			dialog.ShowConfirm("Add folder",
@@ -572,7 +867,7 @@ func main() {
 					}
 					setBusy(true)
 					go runBatch(mp, paths, "Adding", func(p string) error {
-						return doAddTrack(mp, p)
+						return doAddCurrent(mp, p)
 					})
 				}, w)
 		}, w)
@@ -599,16 +894,15 @@ func main() {
 			}
 		}
 		if len(items) == 0 {
-			dialog.ShowInformation("Nothing selected", "Check at least one song to delete.", w)
+			dialog.ShowInformation("Nothing selected", "Check at least one item to delete.", w)
 			return
 		}
-		dialog.ShowConfirm("Delete songs",
-			fmt.Sprintf("Permanently delete %d song(s)?", len(items)),
+		dialog.ShowConfirm("Delete items",
+			fmt.Sprintf("Permanently delete %d item(s)?", len(items)),
 			func(ok bool) {
 				if !ok {
 					return
 				}
-				// convert to paths for runBatch (reuse title as label)
 				titles := make([]string, len(items))
 				ids    := make([]int, len(items))
 				for i, it := range items {
@@ -624,7 +918,7 @@ func main() {
 						fyne.Do(func() {
 							progressLabel.SetText(fmt.Sprintf("Deleting %d / %d", idx, total))
 						})
-						if err := doDeleteTrack(mp, id); err != nil {
+						if err := doDeleteCurrent(mp, id); err != nil {
 							errs = append(errs, fmt.Sprintf("%s: %v", titles[i], err))
 						}
 					}
@@ -654,13 +948,13 @@ func main() {
 		songList.Refresh()
 	})
 
-	infoForm := widget.NewForm(
-		widget.NewFormItem("Model",    modelVal),
-		widget.NewFormItem("GUID",     guidVal),
-		widget.NewFormItem("Capacity", capacityVal),
-		widget.NewFormItem("Used",     usedVal),
-		widget.NewFormItem("Free",     freeVal),
-		widget.NewFormItem("Songs",    songsVal),
+	infoForm := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Model"),    modelVal,
+		widget.NewLabel("GUID"),     guidVal,
+		widget.NewLabel("Capacity"), capacityVal,
+		widget.NewLabel("Used"),     usedVal,
+		widget.NewLabel("Free"),     freeVal,
+		contentTitle,                contentVal,
 	)
 
 	leftPanel := container.NewBorder(
@@ -671,10 +965,11 @@ func main() {
 
 	rightPanel := container.NewBorder(
 		searchEntry,
-		container.NewPadded(container.NewHBox(
+		container.NewPadded(container.New(
+			layout.NewHBoxLayout(),
 			deleteBtn, selectAllBtn, selectNoneBtn,
-			widget.NewLabel(""),
-			progressLabel,
+			layout.NewSpacer(),
+			mediaTypeDropdown,
 		)),
 		nil, nil,
 		songList,
